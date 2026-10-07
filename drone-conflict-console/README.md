@@ -124,7 +124,7 @@ drone-conflict-console/
 ├── examples/crossroads.json
 ├── examples/endpoint_meet.json  # 两架次仅在航段端点同一时刻相遇（瞬时冲突复盘演练）
 ├── scripts/
-│   └── verify_multiprocess.py  # 双进程共库：并发上报 + 建批次/求解交错（case E）的 HTTP 级验证脚本
+│   └── verify_multiprocess.py  # 双进程共库：并发上报 + 建批次/求解交错（case E，提交屏障强制顺序）的 HTTP 级验证脚本
 ├── tests/               # 几何交叉验证 + 求解器暴力验证 + 批次/预警语义 + 建批次/求解交错裁决
 ├── requirements.txt
 ├── Dockerfile
@@ -232,25 +232,54 @@ python3 scripts/verify_multiprocess.py
 # 自定义地址： BASE1=http://... BASE2=http://... python3 scripts/verify_multiprocess.py
 ```
 
+也可以**全程在 Docker Compose 里一键完成**双进程核对：`verify` profile 会
+同时拉起 `web` 与 `web2`（同一份数据卷），等两个进程都通过健康检查后，在
+`verify` 容器内运行同一脚本（以容器名 `web`/`web2` 互访），脚本的退出码即
+整条命令的退出码：
+
+```bash
+docker compose --profile verify up --build \
+  --abort-on-container-exit --exit-code-from verify
+# 退出码 0 = 全部通过；非 0 即脚本失败（日志见 verify 容器输出）
+docker compose --profile verify down   # 结束（加 -v 同时清空数据卷）
+```
+
 脚本覆盖：修订 3 先提交时，另一进程提交修订 2 返回 `409 stale_revision` 且
 `current_revision=3`；修订 2 先提交时，修订 3 仍可更新；两个进程**同时**提交
 2 与 3（多轮，含两种提交先后）后，批次详情、页面数据与预警一律使用最高修订 3
 的实际偏移；并发首报按同号规则处理（同值一插一幂等）；以及**复盘节点在两个进程
 看来完全一致**——只有已接受的写入产生节点、被拒的旧号不产生、节点顺序即实际
 提交顺序、任一进程/重复加载对同一节点同一 `t` 的复盘结果逐字节相同、未知节点
-返回 404。此外还覆盖**建批次与 `/solve` 交错**（case E）：两个进程同时对同一
-场景发起“建批次”和“重算”，多轮重复：
+返回 404。
 
-- 重算返回 `unknown` 先提交时，未显式选用旧表的批次请求按权威标记
-  `409 latest_solve_unverified` 拒绝且**不留批次**；只有 `use_stored_plan:true`
-  且确认旧表原阈值（30/10）才创建（201，冻结旧表），确认成本次新阈值（45/12）
-  仍是 `409 stored_plan_threshold_mismatch`；
-- 批次先提交时，批次保留其提交时有效的旧快照，标记随后落库后再发的无标志请求
-  仍被 `409` 拒绝；
-- 与新的已验证可行重算并发时，建出的批次冻结其提交时刻有效的方案，且两个进程
-  读到的批次逐字节相同；
-- 与确证 `infeasible` 的重算并发时，无解落库后的后续建批次请求一律 `400`、不
-  再产生批次（只有真正先提交的批次允许存在）。
+**建批次与 `/solve` 交错（case E）**不再靠“多跑几轮随机并发”碰提交顺序，而是
+用**提交屏障**确定地控制顺序：每个写接口都在**同一个请求内**先提交 SQLite
+写事务、再返回 HTTP 响应，因此**收到响应即代表已提交**——先等第一个请求的
+响应、再从另一进程发出第二个请求，就强制了唯一确定的提交顺序，与机器快慢
+无关。脚本据此强制并逐一核验三种顺序（任一期望不成立即失败）：
+
+- **unknown 先提交**（E-U1）：先在进程 1 重算出 `unknown`（新阈值 45/12 +
+  锁定，极小求解时限）并等响应，再在进程 2 发**无标志**建批次——必须
+  `409 latest_solve_unverified` 且**不留批次**；确认成本次新阈值（45/12）
+  `409 stored_plan_threshold_mismatch`、缺确认
+  `409 stored_plan_threshold_confirmation_required`，均不留批次；只有
+  `use_stored_plan:true` 且确认旧表**原阈值**（30/10）才 201 并冻结旧表；
+- **批次先提交**（E-B1）：先在进程 2 无标志建批次（201，冻结旧表
+  30/10、`{A:4,B:0,C:2,D:6}`）并等响应，再在进程 1 提交 `unknown` 重算——
+  已建批次在两个进程读来都仍是旧快照（随后的标记不能追溯修改它），而标记
+  落库**之后**再发的无标志请求一律 `409` 且不新增批次；
+- **新可行解先提交**（E-F1/E-F2）：新重算用**可区分的第二份方案**——阈值
+  换成 25/8 并锁定 `UAV-B=5`，解得 `{A:3,B:5,C:8,D:11}`，阈值与偏移都与旧表
+  不同（脚本先断言“可区分”成立，否则核验无意义并明确失败）。新解提交后无标志
+  建批次必须冻结**新阈值 25/8 与新偏移**——错冻旧表（30/10、旧偏移）会被立刻
+  识破；E-F2 还核验“标记在立 → 新可行解清标记 → 无标志创建恢复并冻新表”；
+- **确证无解先提交**（E-I1）：`infeasible` 落库后建批次一律 `400`、不留批次。
+
+此外还有**同时并发**轮次（E-R，屏障同步同刻发请求）作为锁竞争路径的压测：
+每轮的提交顺序**从响应反推确认**（409 ⇒ unknown 先提交；201 ⇒ 批次先提交；
+可行竞速中冻结的“阈值+偏移”三元组指明哪份表在批次提交时权威），并按所确认
+顺序的期望逐轮核验——这些轮次只确认、不承担覆盖，三种顺序的覆盖完全由上面
+的强制用例保证，**不靠增加随机轮数声称覆盖**。
 结束后 `docker compose --profile multiproc down` 停止两个进程。
 
 ---
@@ -568,8 +597,11 @@ curl -i -X PUT http://localhost:8000/api/batches/1/reports \
 批次；响应状态码、`detail` 字段与成功响应结构均保持不变。该交错的确定性双进程
 核对见 `tests/test_batch_solve_race.py`（用一个进程持有未提交写锁，强制另一进程
 的批次事务在其提交后才读取权威行，分别覆盖 unknown 先提交、新可行解先提交、确证
-无解/无表先提交、改名穿插以及批次先提交四种顺序），HTTP 级多轮真并发核对见
-`scripts/verify_multiprocess.py` 的 case E。
+无解/无表先提交、改名穿插以及批次先提交四种顺序），HTTP 级核对见
+`scripts/verify_multiprocess.py` 的 case E——它利用“写接口先提交、后返回响应”
+这一**提交屏障**，用“等响应再发下一请求”强制三种提交顺序逐一核验（新可行解用
+阈值与偏移都可区分的第二份方案，错冻旧表必被识破），另以同刻并发轮次从响应
+反推确认顺序做锁竞争压测（只确认、不承担覆盖）。
 
 ### 3) 评估预警（含拒绝、逾期、不完整标记）
 
@@ -909,6 +941,14 @@ python tests/test_batches_warning.py       # 批次：修订协议/多进程共�
 python tests/test_workzone_window.py       # 作业区：圆柱占用解析几何 vs 密采样/闭区间相切/逾期与拒绝/安全窗口
 ```
 
+HTTP 级双进程共库核验（需先按上文“一键启动”起两个进程，或用
+`docker compose --profile verify up --build --abort-on-container-exit
+--exit-code-from verify` 一键完成）：
+
+```bash
+python3 scripts/verify_multiprocess.py   # 双进程共库：并发上报修订裁决 + 建批次/求解交错（提交屏障强制 unknown/批次/新可行解三种顺序）
+```
+
 - `test_geometry_crossval.py` 用三套相互独立的实现（多边形/椭圆柱解析、
   连续时间区间剖分、密采样神谕）对上千个随机航段对与擦边案例做一致性校验；
 - `test_solver_bruteforce.py` 在小窗口下穷举所有起飞组合，验证最优目标、
@@ -964,7 +1004,9 @@ python tests/test_workzone_window.py       # 作业区：圆柱占用解析几�
   设置了忙等待，上报用条件写入仲裁，并发修订不会回退；**建批次同样在写事务内读取
   权威状态并冻结快照**，与 `/solve` 交错时按提交顺序裁决（`unknown` 先提交则未选
   旧表者 `409` 不留批次、新可行解先提交则冻新表、批次先提交则保留当时快照）。可用
-  `docker compose --profile multiproc up` 起两个进程并运行
-  `scripts/verify_multiprocess.py`（含 case E 的建批次/求解交错）或
+  `docker compose --profile verify up --build --abort-on-container-exit
+  --exit-code-from verify` 一键起两个进程并自动运行
+  `scripts/verify_multiprocess.py`（case E 用提交屏障强制三种提交顺序逐一核验），
+  或 `docker compose --profile multiproc up` 起两个进程后手动运行该脚本，或
   `python tests/test_batch_solve_race.py`（确定性持锁交错）验证。复盘节点与上报写在同一事务内提交，
   因此共库并发时节点与写入原子对应、按实际提交顺序复盘，重载结果一致。

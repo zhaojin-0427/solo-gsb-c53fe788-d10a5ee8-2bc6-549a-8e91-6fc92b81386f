@@ -18,7 +18,7 @@ services:
   # for the two-process shared-DB verification (see README):
   #   docker compose --profile multiproc up --build
   web2:
-    profiles: ["multiproc"]
+    profiles: ["multiproc", "verify"]
     image: drone-conflict-console:latest
     build: .
     container_name: drone-conflict-console-2
@@ -34,6 +34,30 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
+
+  # One-click two-process verification: starts web + web2 against the SAME
+  # database volume, waits for both healthchecks, then runs
+  # scripts/verify_multiprocess.py over HTTP against both processes and
+  # exits with the script's status (see README):
+  #   docker compose --profile verify up --build \
+  #     --abort-on-container-exit --exit-code-from verify
+  verify:
+    profiles: ["verify"]
+    image: drone-conflict-console:latest
+    build: .
+    container_name: drone-conflict-console-verify
+    depends_on:
+      web:
+        condition: service_healthy
+      web2:
+        condition: service_healthy
+    environment:
+      BASE1: http://web:8000
+      BASE2: http://web2:8000
+    command: ["python", "scripts/verify_multiprocess.py"]
+    healthcheck:
+      disable: true
+    restart: "no"
 
 volumes:
   dcc-data:

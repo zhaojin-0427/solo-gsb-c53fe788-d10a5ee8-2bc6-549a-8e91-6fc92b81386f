@@ -17,6 +17,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 COPY examples ./examples
+COPY scripts ./scripts
 COPY README.md ./README.md
 
 RUN mkdir -p /data
