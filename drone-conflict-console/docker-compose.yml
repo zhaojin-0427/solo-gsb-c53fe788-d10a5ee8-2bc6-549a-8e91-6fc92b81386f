@@ -1,0 +1,39 @@
+services:
+  web:
+    build: .
+    image: drone-conflict-console:latest
+    container_name: drone-conflict-console
+    ports:
+      - "8000:8000"
+    volumes:
+      - dcc-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health').status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # Optional second process sharing the SAME database volume. Start it only
+  # for the two-process shared-DB verification (see README):
+  #   docker compose --profile multiproc up --build
+  web2:
+    profiles: ["multiproc"]
+    image: drone-conflict-console:latest
+    build: .
+    container_name: drone-conflict-console-2
+    ports:
+      - "8001:8000"
+    volumes:
+      - dcc-data:/data
+    environment:
+      DCC_DB_PATH: /data/console.db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health').status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  dcc-data:

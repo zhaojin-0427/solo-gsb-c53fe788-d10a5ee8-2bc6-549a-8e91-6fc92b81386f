@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>无人机航迹冲突消解台</title>
+<link rel="stylesheet" href="/app/style.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">🛩️ 无人机航迹冲突消解台</div>
+  <div class="top-actions">
+    <label class="btn-like file-btn">
+      导入航迹 JSON
+      <input id="fileInput" type="file" accept=".json,application/json" hidden />
+    </label>
+    <button id="loadExampleBtn">载入示例</button>
+    <button id="savePlanBtn" disabled>保存当前方案</button>
+    <button id="newSolveBtn" disabled>重算（应用锁定）</button>
+  </div>
+</header>
+
+<main class="layout">
+  <aside class="sidebar">
+    <section class="card" id="paramsCard">
+      <h3>安全参数</h3>
+      <div class="row">
+        <label>安全半径 R (m)</label>
+        <input id="safetyRadius" type="number" min="0.1" step="1" value="30" />
+      </div>
+      <div class="row">
+        <label>安全高度 H (m)</label>
+        <input id="safetyHeight" type="number" min="0.1" step="1" value="10" />
+      </div>
+      <div class="row">
+        <label>求解时限 (s)</label>
+        <input id="timeLimit" type="number" min="1" max="120" step="1" value="20" />
+      </div>
+      <div class="row check">
+        <input id="showEarliest" type="checkbox" checked />
+        <label for="showEarliest">显示最早起飞航迹（虚线）</label>
+      </div>
+      <div class="row check">
+        <input id="showSolved" type="checkbox" checked />
+        <label for="showSolved">显示求解后航迹（实线）</label>
+      </div>
+      <div class="row check">
+        <input id="showConflicts" type="checkbox" checked />
+        <label for="showConflicts">高亮冲突点</label>
+      </div>
+    </section>
+
+    <section class="card" id="sortiesCard">
+      <h3>架次与锁定</h3>
+      <div class="hint">勾选“锁定”并填写整数秒偏移，再点“重算”。</div>
+      <div id="sortiesList" class="sorties-list"></div>
+    </section>
+
+    <section class="card" id="historyCard">
+      <h3>已保存方案</h3>
+      <div id="historyList" class="history-list"></div>
+    </section>
+
+    <section class="card" id="batchCard">
+      <h3>执行批次与偏差预警</h3>
+      <div class="hint">从当前可行方案创建执行批次：冻结输入航迹、安全阈值与计划偏移；之后对原方案重算不会改变批次。若重算超时（unknown），本次新约束未经验证，按钮会变成“选用已保存旧表创建批次（原阈值…）”——只有显式选择才会用 SQLite 中保留的旧表及其原阈值冻结批次。</div>
+      <div class="row" style="margin-bottom:8px">
+        <button id="createBatchBtn" disabled>从当前方案创建执行批次</button>
+      </div>
+      <div id="batchList" class="history-list"></div>
+
+      <div id="batchDetail" class="hidden" style="margin-top:12px;border-top:1px solid var(--line);padding-top:10px">
+        <div class="bd-head">
+          <span id="batchTitle" class="bd-title"></span>
+          <span id="batchDel" class="h-del" title="删除批次">🗑</span>
+        </div>
+        <div class="hint" id="batchPlan"></div>
+
+        <div class="row" style="margin:8px 0 6px">
+          <label>当前秒 t（非负整数）</label>
+          <div class="t-row">
+            <input id="warnT" type="number" min="0" step="1" value="0" />
+            <button id="evalWarnBtn">评估预警</button>
+          </div>
+        </div>
+        <div id="warnSummary" class="warn-summary"></div>
+        <div id="warnSorties" class="warn-sorties"></div>
+        <div id="warnConflicts" class="warn-conflicts"></div>
+
+        <div class="wz-block">
+          <div class="rv-title">临时作业区开工窗口</div>
+          <div class="hint">输入竖直圆柱保护区（水平中心、正半径、上下高度）、截止秒 T 与正整数作业时长 d，沿用上方当前秒 t。服务从冻结批次与最新上报还原航迹，用连续时间几何计算 [t, T−d] 内不与航迹相交的整数秒开工起点区间及最早起点；触及圆柱边界、航点或作业起止时刻均算占用。逾期架次存在时不可确认且不提供安全起点。</div>
+          <div class="wz-grid">
+            <label>中心 X (m)<input id="wzCx" type="number" step="any" value="120" /></label>
+            <label>中心 Y (m)<input id="wzCy" type="number" step="any" value="0" /></label>
+            <label>半径 r (m)<input id="wzR" type="number" min="0.000001" step="any" value="30" /></label>
+            <label>高度下界 (m)<input id="wzZlo" type="number" step="any" value="15" /></label>
+            <label>高度上界 (m)<input id="wzZhi" type="number" step="any" value="25" /></label>
+            <label>截止秒 T<input id="wzT" type="number" step="1" value="30" /></label>
+            <label>作业时长 d (s)<input id="wzD" type="number" min="1" step="1" value="4" /></label>
+          </div>
+          <div class="row" style="margin:6px 0">
+            <div class="t-row">
+              <button id="evalWzBtn">查询开工窗口（用上方 t）</button>
+            </div>
+          </div>
+          <div id="wzBox" class="wz-box"></div>
+        </div>
+
+        <div class="rv-block">
+          <div class="rv-title">预警变更复盘</div>
+          <div class="hint">选择一次已接受的上报节点，用与预警相同的当前秒 t，复盘该上报前后的预警变化。同号同值重试与被拒绝的旧号不生成节点。</div>
+          <div class="row" style="margin:6px 0">
+            <label>复盘节点</label>
+            <div class="t-row">
+              <select id="reviewNode" class="rv-select"></select>
+              <button id="reviewBtn">复盘（用上方 t）</button>
+            </div>
+          </div>
+          <div id="reviewBox" class="review-box"></div>
+        </div>
+      </div>
+    </section>
+  </aside>
+
+  <section class="content">
+    <div class="card map-card">
+      <div class="card-head">
+        <h3>水平航迹（XY，米）</h3>
+        <div id="mapLegend" class="legend"></div>
+      </div>
+      <canvas id="mapCanvas" width="900" height="520"></canvas>
+    </div>
+
+    <div class="card timeline-card">
+      <div class="card-head">
+        <h3>时间轴</h3>
+        <div class="time-controls">
+          <input id="timeScrub" type="range" min="0" max="100" value="0" step="0.1" />
+          <span id="timeLabel" class="time-label">t = 0 s</span>
+        </div>
+      </div>
+      <canvas id="timelineCanvas" width="900" height="220"></canvas>
+    </div>
+
+    <div class="card profile-card">
+      <div class="card-head"><h3>高度剖面（Z 随时间）</h3></div>
+      <canvas id="profileCanvas" width="900" height="150"></canvas>
+    </div>
+  </section>
+</main>
+
+<div id="resultPanel" class="result-panel hidden">
+  <div class="result-head">
+    <span id="resultTitle">求解结果</span>
+    <button id="closeResult">×</button>
+  </div>
+  <div id="resultBody"></div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/app/app.js"></script>
+</body>
+</html>

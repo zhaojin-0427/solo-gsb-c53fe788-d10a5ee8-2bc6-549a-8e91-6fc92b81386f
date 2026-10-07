@@ -1,0 +1,24 @@
+{
+  "safety_radius": 30,
+  "safety_height": 10,
+  "sorties": [
+    {
+      "id": "UAV-A",
+      "weight": 1,
+      "window_hi": 20,
+      "waypoints": [
+        {"x": 0, "y": 0, "z": 20, "t": 0},
+        {"x": 100, "y": 0, "z": 20, "t": 10}
+      ]
+    },
+    {
+      "id": "UAV-B",
+      "weight": 1,
+      "window_hi": 20,
+      "waypoints": [
+        {"x": 100, "y": 0, "z": 20, "t": 0},
+        {"x": 200, "y": 0, "z": 20, "t": 10}
+      ]
+    }
+  ]
+}
