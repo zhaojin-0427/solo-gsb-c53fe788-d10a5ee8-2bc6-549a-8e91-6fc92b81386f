@@ -11,7 +11,7 @@ Easiest way (see README):
     docker compose --profile multiproc up --build
     python3 scripts/verify_multiprocess.py
 
-The script imports the bundled example, solves/saves it, creates execution
+The script imports the bundled examples, solves/saves them, creates execution
 batches and then exercises the revision protocol *across the two processes*:
 
 * case A: revision 3 committed first, then revision 2 from the other process
@@ -23,17 +23,48 @@ batches and then exercises the revision protocol *across the two processes*:
   one insert and one idempotent retry.
 * case E (batch creation vs. /solve interleaving): a batch request races a
   /solve against the SAME scenario from the OTHER process.  The batch route
-  must arbitrate on the AUTHORITATIVE scenario row inside its write
-  transaction, not on a pre-transaction read:
-    - when the racing solve commits ``unknown`` (new locks/thresholds) first,
-      only ``use_stored_plan=true`` plus a confirmation of the OLD table's
-      original thresholds may still create (201, frozen on the old table); a
-      request that never selected the old table MUST be refused 409
-      (``latest_solve_unverified``) without a batch - the stale-read bypass
-      where the unflagged request still got 201 must be impossible;
-    - when a NEW verified feasible solve commits first, any created batch
-      freezes the NEW plan/thresholds (never the stale old table);
-    - the request that commits first simply keeps the snapshot valid then.
+  arbitrates on the AUTHORITATIVE scenario row INSIDE its single
+  ``BEGIN IMMEDIATE`` write transaction, never on a read taken before it.
+  Unlike an unconstrained coin-flip race, every required commit order below is
+  either FORCED (the racing solve provably has not committed when the batch
+  request is answered) or CONFIRMED (the batch request is only sent once the
+  solve's committed state is observable):
+
+    E-unk-first : the ``unknown`` marker COMMITS FIRST.  The solve is started
+      first and the unflagged batch is sent only AFTER the marker is visible
+      from BOTH processes -> 409 ``latest_solve_unverified`` and NO batch.
+      The explicit old-table path is then checked: ``use_stored_plan=true``
+      with the retained OLD table's original thresholds creates (201, frozen
+      old table); confirming the NEW attempted thresholds is 409
+      ``stored_plan_threshold_mismatch``;
+    E-batch-first: the batch COMMITS FIRST while the racing solve is still
+      computing.  The solve is deliberately long (it provably runs the whole
+      time limit and returns ``unknown``); the batch request, fired truly
+      concurrently from the other process, is answered hundreds of ms BEFORE
+      the solve even reaches its write transaction, so the returned 201
+      logically proves the batch committed first - it must freeze the OLD
+      snapshot (old R/H, old offsets).  After the solve eventually commits,
+      a FOLLOW-UP unflagged request is 409 and leaves no extra batch;
+    E-new-first: a NEW VERIFIED feasible solve COMMITS FIRST with DIFFERENT
+      safety thresholds AND DIFFERENT offsets than the retained old table.
+      The batch is sent only once the new table is visible from both
+      processes -> 201 freezing the NEW R/H and the NEW offsets, never the
+      stale old table; it is byte-identical when read back from either
+      process;
+    E-new-race: the same new-feasible solve races a batch while it is still
+      computing; the batch wins (its write transaction is acquired while the
+      solve is still inside CP-SAT), so it keeps the old snapshot - and a
+      second batch sent after the new table committed freezes the new one.
+      The two frozen batches are therefore DIFFERENT in exactly the order
+      their commits observed the state, which is what catches a stale-freeze.
+
+  The two feasible plans come from ``examples/dense_corridor.json`` (20 UAVs
+  crossing one corridor): at (R,H)=(1,1) CP-SAT proves a unique optimal plan
+  P0 within milliseconds; at (8,4), with a generous limit, it finds a
+  DIFFERENT feasible plan P1 (different thresholds AND different offsets).
+  If a recomputation does not return the expected status/plan, or a required
+  commit order cannot be confirmed, this script FAILS that case explicitly -
+  it never claims coverage from random extra rounds.
 * review nodes: every accepted write above gets exactly one node (idempotent
   and rejected writes get none), visible in the same commit order from both
   processes; the node's before/after snapshots replay to the stored state and
@@ -51,6 +82,7 @@ import json
 import os
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -70,7 +102,16 @@ def check(cond, msg):
         FAILURES += 1
 
 
-def call(method, base, path, payload=None):
+class ExpectationFailed(Exception):
+    """A case-E expectation was not met (or an order could not be confirmed).
+
+    Raised instead of a bare ``assert`` so the failure is reported as an
+    explicit FAIL line with the reason - never as a traceback - and the other
+    independent sub-cases still run.
+    """
+
+
+def call(method, base, path, payload=None, timeout=90.0):
     """Return (http_status, parsed_json)."""
     data = None
     headers = {}
@@ -80,7 +121,7 @@ def call(method, base, path, payload=None):
     req = urllib.request.Request(base + path, data=data, headers=headers,
                                  method=method)
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, json.loads(resp.read().decode())
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read().decode())
@@ -89,12 +130,11 @@ def call(method, base, path, payload=None):
 def wait_healthy(base):
     for _ in range(60):
         try:
-            status, _ = call("GET", base, "/api/health")
+            status, _ = call("GET", base, "/api/health", timeout=5)
             if status == 200:
                 return
         except OSError:
             pass
-        import time
         time.sleep(1)
     raise SystemExit(f"server not healthy: {base}")
 
@@ -161,6 +201,121 @@ def race(bid, offers):
 
     with ThreadPoolExecutor(max_workers=len(offers)) as pool:
         return list(pool.map(lambda a: one(*a), offers))
+
+
+# ---------------------------------------------------------------------------
+# Case E helpers: deterministic batch/solve interleavings over real HTTP.
+# ---------------------------------------------------------------------------
+
+# The dense-corridor fixture is deliberately tuned so that:
+#   * (R,H)=(1,1)   -> a unique OPTIMAL plan P0 found in a few ms;
+#   * (R,H)=(60,1)  with a short limit -> the feasibility probe runs the WHOLE
+#                      limit and proves nothing (status "unknown"), so the
+#                      request occupies ~UNKNOWN_LIMIT seconds BEFORE opening
+#                      its write transaction;
+#   * (R,H)=(8,4)   with a generous limit -> a DIFFERENT feasible plan P1
+#                      (different thresholds and different offsets from P0),
+#                      and the search also keeps the request busy for seconds
+#                      before it commits (so a concurrent batch provably wins
+#                      the write lock).
+# The numbers were chosen with a large hardware margin; the script treats a
+# mismatch as a hard failure instead of "covering it with another round".
+DENSE = json.loads((ROOT / "examples" / "dense_corridor.json").read_text())
+P0_R, P0_H = 1.0, 1.0
+NEW_R, NEW_H = 8.0, 4.0
+HARD_R, HARD_H = 60.0, 1.0
+UNKNOWN_LIMIT = 1.2          # seconds the unknown solve stays inside CP-SAT
+FEASIBLE_LIMIT = 3.0         # seconds the new-feasible solve keeps searching
+UNKNOWN_MIN_ELAPSED = 0.9    # proof that the solve really ran the long probe
+BATCH_MAX_ELAPSED = 0.3      # a batch answered this fast cannot have queued
+# behind a solve still holding the write lock (the solve's write txn starts
+# only AFTER its CP-SAT search returns).
+
+
+def import_dense(base):
+    status, body = call("POST", base, "/api/import", DENSE)
+    if status != 200:
+        raise ExpectationFailed(f"import dense_corridor via {base} failed: "
+                                f"HTTP {status} {body}")
+    return body["scenario_id"]
+
+
+def solve_p0(sid, base=BASE1):
+    """Seed the verified-feasible OLD table P0 (1/1, unique optimum)."""
+    status, body = call("POST", base, f"/api/scenarios/{sid}/solve",
+                        {"time_limit": 5, "safety_radius": P0_R,
+                         "safety_height": P0_H})
+    if not (status == 200 and body["solution"]["feasible"]):
+        raise ExpectationFailed(
+            f"OLD-table recompute at {P0_R}/{P0_H} did not return a feasible "
+            f"plan: HTTP {status} {body.get('solution')}")
+    sol = body["solution"]
+    if sol["status"] != "optimal":
+        raise ExpectationFailed(
+            f"OLD-table plan expected status optimal, got {sol['status']}; "
+            f"cannot certify its thresholds/offsets as the OLD snapshot")
+    return sol["offsets"], (float(body["safety_radius"]),
+                            float(body["safety_height"]))
+
+
+def scenario_view(base, sid):
+    status, body = call("GET", base, f"/api/scenarios/{sid}")
+    if status != 200:
+        raise ExpectationFailed(f"GET scenario {sid} via {base} failed: "
+                                f"HTTP {status} {body}")
+    return body
+
+
+def wait_state(sid, predicate, what, bases=(BASE1, BASE2),
+               timeout=30.0, interval=0.02):
+    """Poll until ``predicate(view)`` is true from EVERY base.
+
+    Polling the cheap list endpoint is avoided on purpose: GET
+    /api/scenarios/{id} rebuilds the geometry, which still costs only a few
+    milliseconds for the fixture and gives the exact committed columns.
+    """
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        views = {b: scenario_view(b, sid) for b in bases}
+        if all(predicate(v) for v in views.values()):
+            return views
+        last = views
+        time.sleep(interval)
+    summary = [(v.get("safety_radius"), v.get("safety_height"),
+                (v.get("solution") or {}).get("status"))
+               for v in last.values()]
+    raise ExpectationFailed(
+        f"state {what!r} not visible on all processes {list(bases)} within "
+        f"{timeout}s (target commit order did not occur); "
+        f"last (R,H,status) per process={summary}")
+
+
+def marker_visible(v):
+    return v.get("unverified_solve") is not None
+
+
+def feasible_plan_visible(v, radius, height):
+    sol = v.get("solution")
+    return (v.get("unverified_solve") is None and sol is not None
+            and sol.get("feasible") and float(v["safety_radius"]) == radius
+            and float(v["safety_height"]) == height)
+
+
+def batch_ids(sid, base=BASE1):
+    status, body = call("GET", base,
+                        f"/api/batches?scenario_id={sid}")
+    if status != 200:
+        raise ExpectationFailed(f"list batches via {base} failed: "
+                                f"HTTP {status} {body}")
+    return {b["id"]: b["name"] for b in body["batches"]}
+
+
+def freezes_plan(bb, radius, height, offsets):
+    return (float(bb["safety_radius"]) == radius
+            and float(bb["safety_height"]) == height
+            and {k: int(v) for k, v in bb["planned_offsets"].items()}
+            == {k: int(v) for k, v in offsets.items()})
 
 
 def main():
@@ -247,233 +402,262 @@ def main():
           f"D: single rev 1 / offset 7 row visible on process 2 -> {rep}")
 
     # --- case E: batch creation interleaving with a racing /solve ----------
-    # Arbitration must run INSIDE the batch write transaction: whichever
-    # request commits first decides the authoritative state, and the loser
-    # re-reads it under the write lock instead of acting on a stale snapshot.
-    def race_pair(call_a, call_b):
-        """Fire two HTTP calls at the same instant; return both responses."""
-        start = threading.Barrier(2)
+    # Arbitration runs INSIDE the batch write transaction.  Each required
+    # order is forced/confirmed, so a re-run does the SAME thing every time;
+    # a recompute that comes back different or an order that cannot be proven
+    # is reported as an explicit FAIL below - never as a traceback and never
+    # papered over with extra random rounds.
+    print("case E: deterministic batch/solve interleavings "
+          "(examples/dense_corridor.json)")
 
-        def one(fn):
-            start.wait()
-            return fn()
+    def expect(cond, msg):
+        if not cond:
+            raise ExpectationFailed(msg)
+
+    def assert_old_snapshot(label, bb, p0_offsets):
+        expect(freezes_plan(bb, P0_R, P0_H, p0_offsets),
+               f"{label}: batch must keep the OLD table P0 at {P0_R}/{P0_H}, "
+               f"got R/H={bb['safety_radius']}/{bb['safety_height']} "
+               f"offsets={bb['planned_offsets']}")
+
+    def fire_pair(fn_a, fn_b):
+        """Release two HTTP calls at the same instant; return
+        ((resp_a, elapsed_a), (resp_b, elapsed_b))."""
+        barrier = threading.Barrier(2)
+
+        def fire(fn):
+            barrier.wait()
+            t0 = time.perf_counter()
+            out = fn()
+            return out, time.perf_counter() - t0
 
         with ThreadPoolExecutor(max_workers=2) as pool:
-            return list(pool.map(one, [call_a, call_b]))
+            fa = pool.submit(fire, fn_a)
+            fb = pool.submit(fire, fn_b)
+            return fa.result(), fb.result()
 
-    def solve_unknown(base, scenario):
-        return lambda: call(
-            "POST", base, f"/api/scenarios/{scenario}/solve",
-            {"time_limit": 0.0001, "safety_radius": 45, "safety_height": 12,
-             "locks": [{"sortie_id": "UAV-B", "offset": 5}]})
+    def run_subcase(name, fn):
+        """Run one independent case-E sub-case; report FAIL instead of abort."""
+        global FAILURES
+        try:
+            evidence = fn()
+        except ExpectationFailed as exc:
+            FAILURES += 1
+            print(f" FAIL {name}: {exc}")
+        except Exception as exc:  # never mask a broken run as a pass
+            FAILURES += 1
+            print(f" FAIL {name}: unexpected error {type(exc).__name__}: {exc}")
+        else:
+            tail = f" ({evidence})" if evidence else ""
+            print(f"  ok  {name}: target commit order confirmed{tail}")
 
-    def solve_feasible(base, scenario):
-        return lambda: call(
-            "POST", base, f"/api/scenarios/{scenario}/solve", {"time_limit": 20})
+    def make_batch(base, sid, payload):
+        return lambda: call("POST", base,
+                            f"/api/scenarios/{sid}/batches", payload)
 
-    def make_batch(base, scenario, payload):
-        return lambda: call(
-            "POST", base, f"/api/scenarios/{scenario}/batches", payload)
+    def solve_unknown(base, sid):
+        return lambda: call("POST", base, f"/api/scenarios/{sid}/solve",
+                            {"time_limit": UNKNOWN_LIMIT,
+                             "safety_radius": HARD_R, "safety_height": HARD_H})
 
-    def reset_feasible(scenario):
-        """Put the scenario back to a plain, marker-free verified feasible
-        state (crossroads optimal plan at the example's 30/10 thresholds)."""
-        status, body = call("POST", BASE1, f"/api/scenarios/{scenario}/solve",
-                            {"time_limit": 20})
-        assert status == 200 and body["solution"]["feasible"], (status, body)
-        assert "unverified_solve" not in body, body
+    def solve_new_feasible(base, sid):
+        return lambda: call("POST", base, f"/api/scenarios/{sid}/solve",
+                            {"time_limit": FEASIBLE_LIMIT,
+                             "safety_radius": NEW_R, "safety_height": NEW_H})
 
-    OPTIMAL = {"UAV-A": 4, "UAV-B": 0, "UAV-C": 2, "UAV-D": 6}
+    # -------- E-unk-first: the unknown marker COMMITS FIRST -----------------
+    def case_unknown_first():
+        esid = import_dense(BASE1)
+        p0, p0_rh = solve_p0(esid)
+        expect(p0_rh == (P0_R, P0_H),
+               f"OLD table stored at {P0_R}/{P0_H}, got {p0_rh}")
+        before = batch_ids(esid)
+        # Run the unknown solve to completion and WAIT until its marker is
+        # committed and observable from BOTH processes before asking the other
+        # process to create the batch.  The batch transaction therefore
+        # necessarily starts AFTER the marker committed - the solve-first
+        # order is CONFIRMED, not gambled on.
+        us_status, us_body = solve_unknown(BASE1, esid)()
+        expect(us_status == 200
+               and us_body["solution"]["status"] == "unknown"
+               and not us_body["solution"]["feasible"]
+               and us_body["solution"].get("elapsed_seconds", 0)
+               >= UNKNOWN_MIN_ELAPSED,
+               f"racing solve must really return unknown after a long probe "
+               f"-> {us_status} {us_body.get('solution')}")
+        wait_state(esid, marker_visible, "unknown marker")
+        # No-flag batch AFTER the committed marker: 409 and no new batch.
+        st, bb = make_batch(BASE2, esid,
+                            {"name": "E-unk-first-unflagged"})()
+        expect(st == 409
+               and bb["detail"]["reason"] == "latest_solve_unverified"
+               and bb["detail"]["stored_plan_original_safety_radius"] == P0_R
+               and bb["detail"]["stored_plan_original_safety_height"] == P0_H,
+               f"unflagged batch after committed marker must be 409 "
+               f"latest_solve_unverified, got {st} {bb}")
+        expect(batch_ids(esid) == before,
+               f"the 409 must leave NO batch behind, got "
+               f"{batch_ids(esid)} vs {before}")
+        # The one admissible marker-era path: explicit selection + OLD R/H.
+        st, bb = make_batch(BASE1, esid, {
+            "name": "E-unk-first-explicit", "use_stored_plan": True,
+            "confirmed_safety_radius": P0_R,
+            "confirmed_safety_height": P0_H})()
+        expect(st == 201,
+               f"explicit selection + OLD thresholds must create -> {st} {bb}")
+        assert_old_snapshot("E-unk-first", bb, p0)
+        st2, b2 = call("GET", BASE2, f"/api/batches/{bb['batch_id']}")
+        expect(st2 == 200 and b2 == {**bb},
+               "explicit old-table batch must be byte-identical from process 2")
+        # Confirming the NEW attempted thresholds must still be refused.
+        st, bb = make_batch(BASE2, esid, {
+            "name": "E-unk-first-wrong", "use_stored_plan": True,
+            "confirmed_safety_radius": HARD_R,
+            "confirmed_safety_height": HARD_H})()
+        expect(st == 409
+               and bb["detail"]["reason"] == "stored_plan_threshold_mismatch",
+               f"confirming the NEW thresholds must be 409 mismatch -> {st} {bb}")
+        expect(batch_ids(esid, BASE2) == batch_ids(esid, BASE1),
+               "batch set must be identical on both processes")
+        return ("unknown marker visible on both processes before the batch; "
+                "unflagged -> 409, no batch; explicit+1/1 -> 201 old table")
 
-    # E1: unflagged batch races an unknown solve.  Whatever the commit order,
-    # an UNFLAGGED 201 after the unknown marker committed is the stale-read
-    # bug; the only legal outcomes are 409 (unknown first) or 201 that
-    # demonstrably committed BEFORE the unknown (marker-then-another request
-    # still refuses).  Repeating settles both commit orders.
-    for trial in range(6):
-        s_status, s_body = call("POST", BASE1, "/api/import",
-                                json.loads((ROOT / "examples/crossroads.json")
-                                           .read_text()))
-        esid = s_body["scenario_id"]
-        assert s_status == 200, (s_status, s_body)
-        assert call("POST", BASE1, f"/api/scenarios/{esid}/solve",
-                    {"time_limit": 20})[0] == 200
-        before = {b["id"] for b in call(
-            "GET", BASE1, f"/api/batches?scenario_id={esid}")[1]["batches"]}
-        s_resp, b_resp = race_pair(
+    # -------- E-batch-first: the batch COMMITS FIRST -----------------------
+    def case_batch_first():
+        esid = import_dense(BASE1)
+        p0, _ = solve_p0(esid)
+        before = batch_ids(esid)
+        # The racing solve provably spends UNKNOWN_LIMIT seconds INSIDE
+        # CP-SAT before it opens its write transaction.  Fire both requests at
+        # the same instant; the batch (a fast write transaction) is answered
+        # while the solve is still searching, so it necessarily acquires the
+        # write lock and commits BEFORE the solve even tries to.
+        (solve_resp, solve_elapsed), (batch_resp, batch_elapsed) = fire_pair(
             solve_unknown(BASE1, esid),
-            make_batch(BASE2, esid, {"name": f"E1-{trial}"}))
-        check(s_resp[0] == 200 and s_resp[1]["solution"]["status"] == "unknown",
-              f"E1{trial}: racing solve is unknown (HTTP {s_resp[0]})")
-        # Wait for the marker to be visible so the follow-up request is
-        # guaranteed to arbitrate AFTER the raced solve committed.
-        import time as _t
-        for _ in range(50):
-            if call("GET", BASE1, f"/api/scenarios/{esid}")[1].get(
-                    "unverified_solve") is not None:
-                break
-            _t.sleep(0.05)
-        bs, bb = b_resp
-        # The marker is now committed.  Decide what the batch response can be:
-        if bs == 201:
-            # It only remains valid if the batch truly committed first; the
-            # batch must freeze the OLD table/thresholds, and a FOLLOW-UP
-            # unflagged request must now be refused (so the stale window is
-            # closed).
-            check(bb["safety_radius"] == 30 and bb["safety_height"] == 10
-                  and bb["planned_offsets"] == OPTIMAL,
-                  f"E1{trial}: batch-first froze the then-valid old table -> {bb}")
-            again = make_batch(BASE1, esid, {"name": f"E1-{trial}-again"})()
-            check(again[0] == 409
-                  and again[1]["detail"]["reason"] == "latest_solve_unverified",
-                  f"E1{trial}: after the marker committed, unflagged batch -> "
-                  f"409 latest_solve_unverified, got {again}")
-            check(again[0] == 409 and not any(
-                b["name"] == f"E1-{trial}-again"
-                for b in call("GET", BASE1, f"/api/batches?scenario_id={esid}"
-                              )[1]["batches"]),
-                  f"E1{trial}: refused follow-up created no batch")
-        else:
-            check(bs == 409
-                  and bb["detail"]["reason"] == "latest_solve_unverified"
-                  and bb["detail"]["stored_plan_original_safety_radius"] == 30
-                  and bb["detail"]["stored_plan_original_safety_height"] == 10,
-                  f"E1{trial}: unknown-first refuses unflagged batch 409, got "
-                  f"{bs} {bb}")
-            after = {b["id"] for b in call(
-                "GET", BASE1, f"/api/batches?scenario_id={esid}")[1]["batches"]}
-            check(before == after,
-                  f"E1{trial}: 409 left no batch behind")
+            make_batch(BASE2, esid, {"name": "E-batch-first"}))
+        sstat, sbody = solve_resp
+        expect(sstat == 200 and sbody["solution"]["status"] == "unknown"
+               and not sbody["solution"]["feasible"]
+               and sbody["solution"].get("elapsed_seconds", 0)
+               >= UNKNOWN_MIN_ELAPSED,
+               f"racing solve must be the long unknown probe -> {solve_resp}")
+        expect(solve_elapsed >= UNKNOWN_MIN_ELAPSED
+               and batch_elapsed <= BATCH_MAX_ELAPSED,
+               f"batch must be answered while the solve still computes "
+               f"(solve {solve_elapsed:.2f}s vs batch {batch_elapsed:.2f}s)")
+        bstat, bbody = batch_resp
+        expect(bstat == 201
+               and solve_elapsed - batch_elapsed >= UNKNOWN_MIN_ELAPSED,
+               f"batch 201 must be provably before the solve commit "
+               f"(HTTP {bstat}, gap {solve_elapsed - batch_elapsed:.2f}s) "
+               f"{bbody}")
+        assert_old_snapshot("E-batch-first", bbody, p0)
+        # Once the marker lands, a FOLLOW-UP unflagged batch is refused; the
+        # race-winning batch is the only one that may exist.
+        wait_state(esid, marker_visible, "unknown marker")
+        st, fb = make_batch(BASE1, esid,
+                            {"name": "E-batch-first-after"})()
+        expect(st == 409
+               and fb["detail"]["reason"] == "latest_solve_unverified",
+               f"follow-up after the marker must be 409, got {st} {fb}")
+        after = batch_ids(esid)
+        expect(set(after) - set(before) == {bbody["batch_id"]},
+               f"only the one race-winning batch may exist "
+               f"(before={before} after={after})")
+        st2, b2 = call("GET", BASE2, f"/api/batches/{bbody['batch_id']}")
+        expect(st2 == 200 and freezes_plan(b2, P0_R, P0_H, p0),
+               "winning batch must still freeze P0 when read from process 2")
+        return (f"batch answered {solve_elapsed - batch_elapsed:.2f}s before "
+                f"the solve commit (solve {solve_elapsed:.2f}s, batch "
+                f"{batch_elapsed:.3f}s); 201 freezes old P0 1/1, follow-up 409")
 
-    # E2: explicit old-table selection (use_stored_plan=true + OLD thresholds)
-    # racing the unknown solve: always 201 (either commit order freezes the
-    # old table at 30/10) - never a silent bypass, never the new thresholds.
-    for trial in range(4):
-        s_status, s_body = call("POST", BASE1, "/api/import",
-                                json.loads((ROOT / "examples/crossroads.json")
-                                           .read_text()))
-        esid = s_body["scenario_id"]
-        assert s_status == 200
-        assert call("POST", BASE1, f"/api/scenarios/{esid}/solve",
-                    {"time_limit": 20})[0] == 200
-        select = {"name": f"E2-{trial}", "use_stored_plan": True,
-                  "confirmed_safety_radius": 30,
-                  "confirmed_safety_height": 10}
-        s_resp, b_resp = race_pair(
-            solve_unknown(BASE1, esid), make_batch(BASE2, esid, select))
-        s_stat, s_body2 = s_resp
-        bs, bb = b_resp
-        if bs == 201:
-            check(bb["safety_radius"] == 30 and bb["safety_height"] == 10
-                  and bb["planned_offsets"] == OPTIMAL,
-                  f"E2{trial}: explicit selection froze the retained old table "
-                  f"-> {bb}")
-        else:
-            # Once the unknown marker is committed first, use_stored_plan=true
-            # with the OLD thresholds is still the one admissible path.
-            check(bs == 201, f"E2{trial}: explicit+old thresholds must create "
-                            f"in either commit order, got {bs} {bb}")
-        # Wait until the unknown marker is visible (the raced solve committed;
-        # a 201 above could only have come from the batch winning the race).
-        for _ in range(50):
-            g = call("GET", BASE1, f"/api/scenarios/{esid}")[1]
-            if g.get("unverified_solve") is not None:
-                break
-            import time as _t
-            _t.sleep(0.05)
-        check(call("GET", BASE1, f"/api/scenarios/{esid}")[1]
-              .get("unverified_solve") is not None,
-              f"E2{trial}: racing unknown marker eventually committed")
-        # With the marker standing, confirming the NEW attempted thresholds is
-        # always refused (they never match the retained old table's R/H).
-        wrong = call("POST", BASE1, f"/api/scenarios/{esid}/batches",
-                     {"name": f"E2-{trial}-wrong", "use_stored_plan": True,
-                      "confirmed_safety_radius": 45,
-                      "confirmed_safety_height": 12})
-        check(wrong[0] == 409
-              and wrong[1]["detail"]["reason"] == "stored_plan_threshold_mismatch",
-              f"E2{trial}: new thresholds never confirm the old table -> {wrong}")
+    # -------- E-new-first: a NEW verified feasible plan COMMITS FIRST -------
+    def case_new_first():
+        esid = import_dense(BASE1)
+        p0, _ = solve_p0(esid)
+        fstat, fbody = solve_new_feasible(BASE1, esid)()
+        expect(fstat == 200 and fbody["solution"]["feasible"],
+               f"recompute at {NEW_R}/{NEW_H} must be feasible -> "
+               f"{fstat} {fbody.get('solution')}")
+        p1 = fbody["solution"]["offsets"]
+        expect({k: int(v) for k, v in p1.items()}
+               != {k: int(v) for k, v in p0.items()},
+               "the NEW feasible plan must have offsets DIFFERENT from the OLD "
+               "table, otherwise freezing the stale table could not be caught "
+               f"(both {p1})")
+        expect((NEW_R, NEW_H) != (P0_R, P0_H),
+               "the NEW plan must use DIFFERENT safety thresholds")
+        # Confirm the NEW table is committed and observable on BOTH processes
+        # BEFORE sending the batch - this pins the solve-first order.
+        views = wait_state(
+            esid, lambda v: feasible_plan_visible(v, NEW_R, NEW_H),
+            f"new feasible plan at {NEW_R}/{NEW_H}")
+        expect(views[BASE2]["solution"]["offsets"] == p1,
+               "process 2 must read the committed NEW offsets before the "
+               "batch request")
+        st, nb = make_batch(BASE2, esid, {"name": "E-new-first"})()
+        expect(st == 201, f"batch must be created (HTTP {st}) {nb}")
+        expect(freezes_plan(nb, NEW_R, NEW_H, p1),
+               f"batch must freeze the NEW table {NEW_R}/{NEW_H} and the NEW "
+               f"offsets, never the stale old table -> R/H="
+               f"{nb['safety_radius']}/{nb['safety_height']} "
+               f"offsets={nb['planned_offsets']}")
+        g1 = call("GET", BASE1, f"/api/batches/{nb['batch_id']}")[1]
+        g2 = call("GET", BASE2, f"/api/batches/{nb['batch_id']}")[1]
+        expect(g1 == g2 == {**nb},
+               "frozen new batch must be byte-identical from both processes")
+        return (f"new feasible table {NEW_R}/{NEW_H} visible on both processes "
+                f"before the batch; 201 freezes the NEW offsets (P1 != P0)")
 
-    # E3: an unflagged batch races a NEW verified feasible solve.  Here both
-    # states are verified-feasible; whichever commits, the created batch (if
-    # any) must freeze the plan valid at ITS commit moment - never a stale
-    # table.  The crossroads optimal plan is unique for 30/10, so we assert
-    # consistency: batch R/H/offsets must equal the scenario row every process
-    # can read right after the race.
-    for trial in range(4):
-        s_status, s_body = call("POST", BASE1, "/api/import",
-                                json.loads((ROOT / "examples/crossroads.json")
-                                           .read_text()))
-        esid = s_body["scenario_id"]
-        assert s_status == 200
-        assert call("POST", BASE1, f"/api/scenarios/{esid}/solve",
-                    {"time_limit": 20})[0] == 200
-        s_resp, b_resp = race_pair(
-            solve_feasible(BASE1, esid),
-            make_batch(BASE2, esid, {"name": f"E3-{trial}"}))
-        check(s_resp[0] == 200 and s_resp[1]["solution"]["feasible"],
-              f"E3{trial}: racing solve feasible (HTTP {s_resp[0]})")
-        bs, bb = b_resp
-        check(bs == 201, f"E3{trial}: batch against a verified table created "
-                         f"(HTTP {bs}) {bb}")
-        if bs == 201:
-            check(bb["safety_radius"] == 30 and bb["safety_height"] == 10
-                  and bb["planned_offsets"] == OPTIMAL,
-                  f"E3{trial}: batch freezes the (unique) verified table, "
-                  f"not stale state -> {bb}")
-            # The created batch is visible identically from both processes.
-            got1 = call("GET", BASE1, f"/api/batches/{bb['batch_id']}")[1]
-            got2 = call("GET", BASE2, f"/api/batches/{bb['batch_id']}")[1]
-            check(got1 == got2 and got1["planned_offsets"] == OPTIMAL,
-                  f"E3{trial}: race-won batch identical from both processes")
+    # ---- E-new-race: NEW feasible solve still computing; BATCH wins -------
+    def case_new_race():
+        esid = import_dense(BASE1)
+        p0, _ = solve_p0(esid)
+        # The new-feasible search keeps the request busy for FEASIBLE_LIMIT
+        # seconds; the concurrent batch acquires the write lock first and
+        # keeps P0.  A SECOND batch after the new table commits must freeze
+        # P1/NEW R/H, so the two batches MUST differ in commit order.
+        (solve_resp2, solve_elapsed2), (batch_resp2, batch_elapsed2) = \
+            fire_pair(solve_new_feasible(BASE1, esid),
+                      make_batch(BASE2, esid, {"name": "E-new-race-old"}))
+        sstat2, sbody2 = solve_resp2
+        expect(sstat2 == 200 and sbody2["solution"]["feasible"],
+               f"racing recompute must return a feasible plan -> {solve_resp2}")
+        p1 = sbody2["solution"]["offsets"]
+        expect({k: int(v) for k, v in p1.items()}
+               != {k: int(v) for k, v in p0.items()},
+               "the racing feasible plan must differ from the old table")
+        bstat2, bbody2 = batch_resp2
+        expect(bstat2 == 201 and solve_elapsed2 - batch_elapsed2 >= 0.9
+               and batch_elapsed2 <= BATCH_MAX_ELAPSED,
+               f"batch must be answered before the long solve commits "
+               f"(solve {solve_elapsed2:.2f}s vs batch {batch_elapsed2:.2f}s) "
+               f"-> {bstat2} {bbody2}")
+        assert_old_snapshot("E-new-race", bbody2, p0)
+        wait_state(esid, lambda v: feasible_plan_visible(v, NEW_R, NEW_H),
+                   "new feasible plan")
+        st, nb2 = make_batch(BASE1, esid,
+                             {"name": "E-new-race-new"})()
+        expect(st == 201 and freezes_plan(nb2, NEW_R, NEW_H, p1),
+               f"the batch AFTER the commit must freeze the NEW table -> "
+               f"HTTP {st}, frozen "
+               f"{None if st != 201 else (nb2['safety_radius'], nb2['safety_height'])}")
+        expect(not freezes_plan(bbody2, NEW_R, NEW_H, p1)
+               and freezes_plan(nb2, NEW_R, NEW_H, p1),
+               "the race-won batch (OLD) and post-commit batch (NEW) must "
+               "freeze DIFFERENT plans in their commit order")
+        expect(call("GET", BASE2,
+                    f"/api/batches/{bbody2['batch_id']}")[1] == {**bbody2},
+               "the OLD race-won batch must stay unchanged on process 2")
+        return (f"racing batch answered {solve_elapsed2 - batch_elapsed2:.2f}s "
+                f"before the solve commits and freezes old P0; post-commit "
+                f"batch freezes new P1 {NEW_R}/{NEW_H}; the two differ")
 
-    # E4: a proven-infeasible solve racing a batch.  Huge thresholds make the
-    # all-zero (and every) schedule conflict; the probe proves infeasible
-    # quickly.  If the batch transaction commits first it keeps the then-valid
-    # plan (201, old table); once the infeasibility commits, every further
-    # batch request is 400 with no new batch.
-    s_status, s_body = call("POST", BASE1, "/api/import",
-                            json.loads((ROOT / "examples/crossroads.json")
-                                       .read_text()))
-    esid = s_body["scenario_id"]
-    assert s_status == 200
-    assert call("POST", BASE1, f"/api/scenarios/{esid}/solve",
-                {"time_limit": 20})[0] == 200
-    before = {b["id"] for b in call(
-        "GET", BASE1, f"/api/batches?scenario_id={esid}")[1]["batches"]}
-    s_resp, b_resp = race_pair(
-        lambda: call("POST", BASE1, f"/api/scenarios/{esid}/solve",
-                     {"time_limit": 20, "safety_radius": 100000,
-                      "safety_height": 100000}),
-        make_batch(BASE2, esid, {"name": "E4-infeas"}))
-    check(s_resp[0] == 200 and not s_resp[1]["solution"]["feasible"]
-          and s_resp[1]["solution"]["status"] == "infeasible",
-          f"E4: racing solve proves infeasible -> {s_resp}")
-    bs, bb = b_resp
-    # Wait for the infeasibility to be visible from process 1.
-    import time as _t
-    for _ in range(50):
-        g = call("GET", BASE1, f"/api/scenarios/{esid}")[1]
-        if g["solution"] and g["solution"].get("status") == "infeasible":
-            break
-        _t.sleep(0.05)
-    if bs == 201:
-        # The batch legitimately won the race and froze the old verified
-        # table; every batch request AFTER the infeasibility must now fail.
-        check(bb["safety_radius"] == 30 and bb["planned_offsets"] == OPTIMAL,
-              f"E4: batch-first froze its then-valid old table -> {bb}")
-    else:
-        check(bs == 400, f"E4: batch refused once infeasibility committed "
-                         f"(HTTP {bs}) {bb}")
-    followup = make_batch(BASE2, esid, {"name": "E4-after-infeas"})()
-    check(followup[0] == 400,
-          f"E4: after proven infeasibility no further batch is created "
-          f"(HTTP {followup[0]}) {followup[1]}")
-    after = {b["id"] for b in call(
-        "GET", BASE1, f"/api/batches?scenario_id={esid}")[1]["batches"]}
-    check(len(after - before) == (1 if bs == 201 else 0),
-          f"E4: only a race-winning batch may exist, none after refusal "
-          f"(before={before} after={after})")
+    for _name, _fn in (("E-unknown-first", case_unknown_first),
+                       ("E-batch-first", case_batch_first),
+                       ("E-new-first", case_new_first),
+                       ("E-new-race", case_new_race)):
+        run_subcase(_name, _fn)
 
     # --- review nodes across the two processes -----------------------------
     # Case A had accepted writes rev1 then rev3 (rev2 was rejected): the

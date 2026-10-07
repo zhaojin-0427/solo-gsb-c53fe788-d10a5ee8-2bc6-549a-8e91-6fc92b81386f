@@ -35,5 +35,37 @@ services:
       timeout: 5s
       retries: 5
 
+  # One-shot two-process verification. Starts together with web/web2 (it
+  # shares the multiproc profile and the SAME dcc-data volume), waits until
+  # both processes answer /api/health, then runs
+  # scripts/verify_multiprocess.py over real HTTP INSIDE the compose network
+  # (BASE1 -> web:8000, BASE2 -> web2:8000) and exits non-zero on any failed
+  # expectation. It uses only the Python standard library.
+  #
+  # Fully containerised, one command:
+  #   docker compose --profile multiproc run --build verify
+  # (or, as part of `docker compose --profile multiproc up`, watch the
+  # `verify-1` log line "RESULT: all two-process shared-DB checks passed".)
+  verify:
+    profiles: ["multiproc"]
+    image: python:3.11-slim
+    container_name: drone-conflict-console-verify
+    working_dir: /work
+    volumes:
+      - ./:/work:ro
+    environment:
+      BASE1: http://web:8000
+      BASE2: http://web2:8000
+    depends_on:
+      web:
+        condition: service_healthy
+      web2:
+        condition: service_healthy
+    restart: "no"
+    command:
+      - python3
+      - scripts/verify_multiprocess.py
+
 volumes:
   dcc-data:
+
